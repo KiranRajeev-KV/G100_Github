@@ -71,7 +71,7 @@ def main(argv=None):
 
     E.DATA, E.FEATS, _ = E.prepare(E.SYM, E.CFG)
     jobs = [(k, f"{root}/fold{k}/{a}_seed{s}/best_trader.zip") for a in E.ARMS for k in sorted(E.DATA) for s in seeds]
-    with mp.get_context("fork").Pool(11) as p:
+    with mp.get_context("fork").Pool(int(os.environ.get("W", 11))) as p:
         res = dict(p.map(partial(job, mult=mult), jobs))
     rows = []
     for k in sorted(E.DATA):
