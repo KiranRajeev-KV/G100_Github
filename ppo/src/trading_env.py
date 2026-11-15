@@ -38,6 +38,7 @@ class TradingEnv(gym.Env):
         segments=None,
         max_episode_steps=5000,
         trade_penalty=0.0,
+        alpha_reward=False,
         decision_every=1,
         start_long=False,
         funding_col=None,
@@ -58,6 +59,8 @@ class TradingEnv(gym.Env):
         # discourages high-churn policies that bleed capital to fees/slippage
         # (the observed dominant failure mode). 0.0 = disabled (original behavior).
         self.trade_penalty = trade_penalty
+        # reward = log return in excess of holding the same instrument long (holding earns 0)
+        self.alpha_reward = alpha_reward
         # V7 options (defaults reproduce the original env):
         #   decision_every -- hold each action for k bars (reward = k-bar log return)
         #   start_long     -- each episode opens fully invested (entry cost charged)
@@ -194,9 +197,13 @@ class TradingEnv(gym.Env):
         # advance k bars (k = 1 is the original single step), recording the
         # value at every bar so Sharpe stays hourly whatever k is
         bar_values = []
+        bench = 0.0   # log return of the always-long position over the same bars
         for _ in range(self.decision_every):
-            if self._funding is not None and self.btc_held > 0:
-                self.btc_held *= 1 - self._funding[self.current_step]
+            if self._funding is not None:
+                bench += np.log(1 - self._funding[self.current_step])
+                if self.btc_held > 0:
+                    self.btc_held *= 1 - self._funding[self.current_step]
+            bench += np.log(self._close[self.current_step + 1] / self._close[self.current_step])
             self.current_step += 1
             bar_values.append(self.cash + self.btc_held * self._close[self.current_step])
             if self.current_step >= self._episode_end - 1:
@@ -216,6 +223,8 @@ class TradingEnv(gym.Env):
         # discourage churn: subtract a fixed penalty on any executed trade
         if traded:
             reward -= self.trade_penalty
+        if self.alpha_reward:
+            reward -= bench
 
         info = {
             "portfolio_value": new_portfolio_value,

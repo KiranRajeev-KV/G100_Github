@@ -61,6 +61,12 @@ def mutate_hyperparams(hp, rng, factor=1.25, bounds=HYPERPARAM_BOUNDS):
     return out
 
 
+def cvar_fitness(scores, lam, q=0.25):
+    """(1 - lam) * mean + lam * mean of the worst q share of segment scores (CVaR blend)."""
+    s = np.sort(np.asarray(scores, dtype=float))
+    return float((1 - lam) * s.mean() + lam * s[:max(1, int(np.ceil(q * len(s))))].mean())
+
+
 @dataclass
 class Trader:
     trader_id: int
@@ -75,6 +81,7 @@ class Trader:
     no_trade_frac: float = 0.0   # share of evaluated segments with zero trades
     _scores: list = field(default_factory=list)
     _no_trade: list = field(default_factory=list)
+    _segs: list = field(default_factory=list)      # per-segment scores, only for trader_cvar
 
     def apply_hyperparams(self):
         self.model.learning_rate = self.hyperparams["learning_rate"]
@@ -82,13 +89,17 @@ class Trader:
         self.model.ent_coef = self.hyperparams["ent_coef"]
         self.model.clip_range = _clip_schedule(self.hyperparams["clip_range"])
 
-    def record(self, score, no_trade_frac=None):
+    def record(self, score, no_trade_frac=None, seg_scores=()):
         self._scores.append(score)
+        self._segs.extend(seg_scores)
         if no_trade_frac is not None:
             self._no_trade.append(no_trade_frac)
 
-    def finalize_fitness(self):
+    def finalize_fitness(self, cvar=0.0):
         self.fitness = float(np.mean(self._scores)) if self._scores else 0.0
+        if cvar and self._segs:
+            self.fitness = cvar_fitness(self._segs, cvar)
+        self._segs = []
         self.no_trade_frac = float(np.mean(self._no_trade)) if self._no_trade else 0.0
         self._scores = []
         self._no_trade = []

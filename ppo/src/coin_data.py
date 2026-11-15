@@ -56,7 +56,12 @@ def _funding(sym, fund_dir):
 
 def load_coin(sym="BTCUSDT"):
     raw_dir, met_dir, fund_dir = _paths(sym)
-    raw = _raw(raw_dir)
+    m = pd.concat([pd.read_csv(f) for f in sorted(glob.glob(f"{met_dir}/*.csv"))])
+    return build_coin(_raw(raw_dir), m, _funding(sym, fund_dir))
+
+
+def build_coin(raw, m, rate):
+    """raw klines (_raw format), futures metrics rows, funding-rate series -> the feature frame."""
     df = add_features(raw[["open_time", "open", "high", "low", "close", "volume"]])
     t = df.open_time.astype("datetime64[ns]")
     r = raw.assign(open_time=raw.open_time.dt.tz_localize(None).astype("datetime64[ns]")).set_index("open_time")
@@ -68,7 +73,7 @@ def load_coin(sym="BTCUSDT"):
         df[f"ofi_{n}h"] = (2 * pd.Series(tb).rolling(n).sum() / pd.Series(v).rolling(n).sum() - 1).values
     df["ofi_z"] = ((ofi - ofi.rolling(168).mean()) / ofi.rolling(168).std()).values
 
-    m = pd.concat([pd.read_csv(f) for f in sorted(glob.glob(f"{met_dir}/*.csv"))])
+    m = m.copy()
     m["t"] = pd.to_datetime(m.create_time).astype("datetime64[ns]")
     m = m.drop_duplicates("t").sort_values("t")
     close_t = pd.DataFrame({"t": (t + pd.Timedelta(hours=1)).values})
@@ -80,7 +85,6 @@ def load_coin(sym="BTCUSDT"):
     df["taker_ls"] = np.log(p.sum_taker_long_short_vol_ratio.where(lambda x: x > 0)).values
 
     # funding paid while holding close[i] -> close[i+1] (settles at open_time[i] + 2h)
-    rate = _funding(sym, fund_dir)
     df["funding_paid"] = rate.reindex((t + pd.Timedelta(hours=2)).values).fillna(0.0).values
     df["open_time"] = t
     return df.replace([np.inf, -np.inf], np.nan)

@@ -69,11 +69,20 @@ def rhat_feature(df, cols, folds_win, horizon):
     return out
 
 
-def prepare(sym, cfg):
+def confirm_windows():
+    """V9 one-shot confirmation folds E0-E2 (LEDGER "V9 PRE-REGISTRATION"): test bars [22000 + 6000k, +6000),
+    train = every bar before the test start (the engine takes the 4,000-bar validation tail off its end)."""
+    return [{"fold": k, "train_start": 0, "train_end": 22000 + 6000 * k,
+             "test_start": 22000 + 6000 * k, "test_end": 28000 + 6000 * k} for k in range(3)]
+
+
+def prepare(sym, cfg, confirm=False):
     from coin_data import FLOW, POS, load_coin, fold_windows
     from build_features import FEATURE_COLUMNS
     df = load_coin(sym)
-    wins = fold_windows(df)
+    if confirm:
+        assert sym == "BTCUSDT"
+    wins = confirm_windows() if confirm else fold_windows(df)
     cols = cfg.get("features") or list(FEATURE_COLUMNS) + (FLOW + POS if cfg.get("flow_pos", True) else [])
     # rhat: one horizon (feature "rhat") or a list of horizons (features "rhat<h>")
     hs = cfg.get("rhat") or []
@@ -178,14 +187,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=11)
     ap.add_argument("--folds", type=int, nargs="*", default=None, help="smoke tests only")
+    ap.add_argument("--confirm", action="store_true", help="V9 one-shot E0-E2 confirmation (runs/coevo7/<name>_confirm)")
     args = ap.parse_args()
     import coevo_node
     CFG = coevo_node.CONFIG
     from evaluate import paired_bootstrap
 
-    DATA, FEATS, wins = prepare(SYM, CFG)
+    DATA, FEATS, wins = prepare(SYM, CFG, args.confirm)
     folds = args.folds if args.folds is not None else [w["fold"] for w in wins]
-    out_root = os.path.join(OUT_BASE, CFG["name"], SYM)
+    out_root = os.path.join(OUT_BASE, CFG["name"] + ("_confirm" if args.confirm else ""), SYM)
     os.makedirs(out_root, exist_ok=True)
     json.dump({"config": CFG, "features": FEATS, "folds": wins}, open(os.path.join(out_root, "contract.json"), "w"),
               indent=2, default=str)
