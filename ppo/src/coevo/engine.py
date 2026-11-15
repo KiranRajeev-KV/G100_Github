@@ -77,6 +77,7 @@ class EngineConfig:
     slippage: float = 0.0005
     # anti-churn / horizon fixes (defaults reproduce the original behavior)
     trade_penalty: float = 0.0         # extra reward penalty per executed trade
+    alpha_reward: bool = False         # training reward in excess of always-long (scoring is unchanged)
     gamma: float = 0.99                # PPO discount; raise (0.995+) for longer horizon
     ent_coef_max: float = 0.1          # upper bound on evolved entropy coef
     ent_coef_min: float = 0.0          # lower bound; 0 = leave at the default 1e-4
@@ -99,6 +100,9 @@ class EngineConfig:
     # K sampled segments and PBT ranks on that score; each adversary proposes
     # segments_per_match segments, scored by its configured objective over all traders.
     shared_exam: int = 0
+    # trader_cvar -- lam in [0, 1]: trader fitness = (1 - lam) * mean + lam * mean of the worst 25% of its
+    # segment scores (match segments, or the shared exam). 0 = plain mean (default).
+    trader_cvar: float = 0.0
     # Skip matches with no executed trades on the adversary's served segments.
     # With cash starts this filters flat portfolios; with start_long=True,
     # no executed trades does not imply zero exposure or zero return.
@@ -126,6 +130,12 @@ class EngineConfig:
     #                 shared_exam): |change of the population-mean score on a
     #                 window since it was last examined|; never-seen windows
     #                 get the generation's mean progress.
+    #   signed_progress -- as progress, but the signed change (gain > 0, drop < 0;
+    #                 PAC, arXiv 2608.30528). |change| is biased upward by score
+    #                 noise; the signed change is not, so noisy windows stop paying.
+    #   signed_progress_bh -- z(signed_progress) + z(regret_bh of the population
+    #                 mean), z-scored across the adversaries each generation: the
+    #                 caution tilt of signed progress plus the stay-in tilt of regret_bh.
     env_fitness: str = "neg_sharpe"
     # Refuse to start in an out_dir that already holds a populated
     # generations.csv (a relaunch destroyed the V4 ledgers). True = overwrite.
@@ -145,14 +155,20 @@ class EngineConfig:
     # adversary picks keep the uniform pool's regime mix (regimes drawn uniformly,
     # adversary chooses within each), so it cannot just move the exposure dial
     adv_regime_lock: bool = False
+    adv_kl_budget: float = 0.0         # cap KL(selection || uniform pool), nats, by raising the temperature (0 = off)
     obs_sign_random: bool = False      # random sign per served match / exam eval (zero-mean drift)
     obs_bound: tuple = ()              # (max |shift|, max |log_scale|) applied; () = genome bounds
+    # forecast-aware adversary: adds three window descriptors to the genome (gate advantage = regret_gate
+    # reference minus always-long, mean rhat24, mean rhat72), so it can aim at windows where the forecast matters
+    adv_gate_desc: bool = False
+    gate_q: tuple = (0.25,)            # regret_gate antagonist: forecast-gate quantiles
 
 
 class CoevolutionEngine:
 
     def __init__(self, config, pool, feature_columns, val_df, out_dir):
         self.cfg = config
+        ep.KL_BUDGET = config.adv_kl_budget
         self.pool = pool
         self.feature_columns = feature_columns
         self.val_df = val_df.reset_index(drop=True)
@@ -177,6 +193,8 @@ class CoevolutionEngine:
             "slippage": config.slippage,
             "trade_penalty": config.trade_penalty,
         }
+        if config.alpha_reward:
+            self.env_kwargs["alpha_reward"] = True
         if config.target_position:
             self.env_kwargs["target_position"] = True
         self._obs_idx = [list(feature_columns).index(c) for c in config.obs_adversary]
@@ -203,6 +221,14 @@ class CoevolutionEngine:
             for i in range(n_traders)
         ]
 
+        self._desc_names = list(DESCRIPTOR_NAMES)
+        if config.adv_gate_desc and config.mode == "coevolution":
+            ref, one = self._gate_reference(), self._gate_reference(cols=())
+            for sg in pool.segments:
+                sg.descriptor = np.append(sg.descriptor, [ref[sg.start] - one[sg.start]] + [
+                    float(pool.df[c].iloc[sg.start:sg.end].mean()) for c in ("rhat24", "rhat72")])
+            self._desc_names += ["gate_advantage", "rhat24_mean", "rhat72_mean"]
+        ep.N_DESC = len(self._desc_names)
         self.env_pop = (
             [ep.random_individual(self.rng) for _ in range(config.n_env)]
             if config.mode == "coevolution" else None
@@ -226,14 +252,15 @@ class CoevolutionEngine:
 
         if config.segment_sampling not in ("uniform", "regime_balanced"):
             raise ValueError(f"unknown segment_sampling {config.segment_sampling!r}")
-        if config.env_fitness not in ("neg_sharpe", "regret", "regret_bh", "pop_regret", "learnability", "progress"):
+        if config.env_fitness not in ("neg_sharpe", "regret", "regret_bh", "regret_gate", "pop_regret", "learnability",
+                                     "progress", "signed_progress", "signed_progress_bh"):
             raise ValueError(f"unknown env_fitness {config.env_fitness!r}")
-        if config.env_fitness in ("pop_regret", "learnability", "progress") and not config.shared_exam:
+        if config.env_fitness in ("pop_regret", "learnability", "progress", "signed_progress", "signed_progress_bh") and not config.shared_exam:
             raise ValueError(f"{config.env_fitness} is scored in the shared exam: set shared_exam > 0")
         # regret reference per pool segment: the best trivial policy's score
         # (cash = 0, buy & hold, MA-crossover) under the same fee model
         self._ref_by_start = {}
-        if config.env_fitness in ("regret", "regret_bh", "learnability") and self.env_pop is not None:
+        if config.env_fitness in ("regret", "regret_bh", "learnability", "signed_progress_bh") and self.env_pop is not None:
             for sg in pool.segments:
                 seg_df = pool.slice(sg)
                 bh = summarize(buy_and_hold(
@@ -241,8 +268,11 @@ class CoevolutionEngine:
                 ma = summarize(ma_crossover(
                     seg_df, config.initial_balance, config.trading_fee, slippage=config.slippage))
                 self._ref_by_start[sg.start] = (
-                    bh[config.fitness_metric] if config.env_fitness in ("regret_bh", "learnability")
+                    bh[config.fitness_metric] if config.env_fitness in ("regret_bh", "learnability", "signed_progress_bh")
                     else max(0.0, bh[config.fitness_metric], ma[config.fitness_metric]))
+
+        if config.env_fitness == "regret_gate" and self.env_pop is not None:
+            self._ref_by_start = self._gate_reference()
 
         # which regime each segment belongs to, so the curriculum the adversary
         # actually served can be logged (not just the genome that chose it)
@@ -353,7 +383,7 @@ class CoevolutionEngine:
              "niche", "temperature", "shift", "log_scale", "selection_entropy", "evaluated",
              "n_matches", "weight_norm",
              "frac_bear", "frac_bull", "frac_sideways"]
-            + [f"w_{name}" for name in DESCRIPTOR_NAMES]
+            + [f"w_{name}" for name in self._desc_names]
             + ["origin"]
         )
         if not self._resuming:
@@ -584,7 +614,7 @@ class CoevolutionEngine:
                 "origin": ind.origin,
             }
             row.update({f"w_{n}": float(w)
-                        for n, w in zip(DESCRIPTOR_NAMES, ind.weights)})
+                        for n, w in zip(self._desc_names, ind.weights)})
             rows.append(row)
         self._append(self.env_log_path, self._env_log_fields, rows)
 
@@ -621,6 +651,24 @@ class CoevolutionEngine:
     # ------------------------------------------------------------------
     # segment selection per mode
     # ------------------------------------------------------------------
+
+    def _gate_reference(self, cols=("rhat24", "rhat72")):
+        """regret_gate reference per pool window: the best of buy & hold and the
+        forecast gates "long iff rhat_h > its pool quantile q" for q in gate_q (a
+        competent antagonist, PAIRED-style), under the trader's own env and cost model."""
+        from types import SimpleNamespace
+        segs = [(sg.start, sg.end) for sg in self.pool.segments]
+        refs = []
+        for col, q in [(c, q) for c in cols for q in self.cfg.gate_q]:
+            i = list(self.feature_columns).index(col)
+            thr = float(self.pool.df[col].quantile(q))
+            gate = SimpleNamespace(predict=lambda obs, deterministic=True, i=i, thr=thr: (int(obs[i] > thr), None))
+            refs.append([m[self.cfg.fitness_metric] for m in tp.evaluate_on_segments(
+                SimpleNamespace(model=gate), self.pool.df, self.feature_columns, segs, self.env_kwargs)[1]])
+        always = SimpleNamespace(predict=lambda obs, deterministic=True: (1, None))
+        refs.append([m[self.cfg.fitness_metric] for m in tp.evaluate_on_segments(
+            SimpleNamespace(model=always), self.pool.df, self.feature_columns, segs, self.env_kwargs)[1]])
+        return {st: float(max(r)) for (st, _), *r in zip(segs, *refs)}
 
     def _uniform_segments(self, n):
         if self.cfg.segment_sampling == "regime_balanced":
@@ -686,7 +734,7 @@ class CoevolutionEngine:
                     kw, cfg.fitness_metric,
                 )
                 no_trade = [m["no_trade"] for m in per_seg]
-                trader.record(score, float(np.mean(no_trade)))
+                trader.record(score, float(np.mean(no_trade)), [m[cfg.fitness_metric] for m in per_seg])
 
                 counted = True
                 if opp is not None:
@@ -720,7 +768,8 @@ class CoevolutionEngine:
                     trader, self.pool.df, self.feature_columns, segs,
                     self.env_kwargs, cfg.fitness_metric,
                 )
-                trader.record(score, float(np.mean([m["no_trade"] for m in per_seg])))
+                trader.record(score, float(np.mean([m["no_trade"] for m in per_seg])),
+                              [m[cfg.fitness_metric] for m in per_seg])
                 self._match_rows.append(self._match_row(
                     gen, trader, len(opponent_idx) + h, "hof", None,
                     segs, score, per_seg, False))
@@ -759,9 +808,11 @@ class CoevolutionEngine:
         cfg = self.cfg
         exam = self._uniform_segments(cfg.shared_exam)
         for t in self.traders:
-            t.fitness, _ = tp.evaluate_on_segments(
+            t.fitness, per = tp.evaluate_on_segments(
                 t, self.pool.df, self.feature_columns, exam,
                 self.env_kwargs, cfg.fitness_metric)
+            if cfg.trader_cvar:
+                t.fitness = tp.cvar_fitness([m[cfg.fitness_metric] for m in per], cfg.trader_cvar)
         pending = []                                 # progress fitness, scored after all adversaries
         for ind in self.env_pop or []:
             segs = self._adv_select(ind, cfg.segments_per_match)
@@ -772,7 +823,7 @@ class CoevolutionEngine:
                     t, self.pool.df, self.feature_columns, segs,
                     kw, cfg.fitness_metric)
                 per_trader.append([m[cfg.fitness_metric] for m in per_seg])
-                if cfg.env_fitness not in ("pop_regret", "learnability", "progress"):
+                if cfg.env_fitness not in ("pop_regret", "learnability", "progress", "signed_progress", "signed_progress_bh"):
                     scores.append(self._adversary_score(segs, per_seg, score))
             if cfg.env_fitness == "pop_regret":
                 S = np.array(per_trader)                     # traders x windows
@@ -780,21 +831,29 @@ class CoevolutionEngine:
             elif cfg.env_fitness == "learnability":
                 p = (np.array(per_trader) > np.array([self._ref_by_start[st] for st, _ in segs])).mean(axis=0)
                 scores = list(p * (1 - p))
-            elif cfg.env_fitness == "progress":
-                pending.append((ind, [(st, v) for (st, _), v in zip(segs, np.array(per_trader).mean(axis=0))]))
+            elif cfg.env_fitness in ("progress", "signed_progress", "signed_progress_bh"):
+                sv = [(st, v) for (st, _), v in zip(segs, np.array(per_trader).mean(axis=0))]
+                pending.append((ind, sv, float(np.mean([self._ref_by_start.get(st, 0.0) - v for st, v in sv]))))
                 continue
             ind.raw_fitness, ind.evaluated = float(np.mean(scores)), True
-        alp = [[abs(v - self._seg_hist[st]) if st in self._seg_hist else None for st, v in sv] for _, sv in pending]
+        f = abs if cfg.env_fitness == "progress" else (lambda d: d)
+        alp = [[f(v - self._seg_hist[st]) if st in self._seg_hist else None for st, v in sv] for _, sv, _ in pending]
         seen = [a for L in alp for a in L if a is not None]
-        for (ind, sv), L in zip(pending, alp):
+        for (ind, sv, _), L in zip(pending, alp):
             ind.raw_fitness = float(np.mean([np.mean(seen) if seen and a is None else (a or 0.0) for a in L]))
             ind.evaluated = True
-        for _, sv in pending:
+        if cfg.env_fitness == "signed_progress_bh" and pending:
+            z = lambda x: (x - x.mean()) / (x.std() or 1.0)
+            sp = z(np.array([ind.raw_fitness for ind, _, _ in pending]))
+            rb = z(np.array([r for _, _, r in pending]))
+            for (ind, _, _), a, b in zip(pending, sp, rb):
+                ind.raw_fitness = float(a + b)
+        for _, sv, _ in pending:
             self._seg_hist.update(sv)
 
     def _adversary_score(self, segs, per_seg, score):
         """What the adversary earns for a match it served (higher = harder)."""
-        if self.cfg.env_fitness in ("regret", "regret_bh"):
+        if self.cfg.env_fitness in ("regret", "regret_bh", "regret_gate"):
             return float(np.mean([
                 self._ref_by_start[st] - m[self.cfg.fitness_metric]
                 for (st, _), m in zip(segs, per_seg)
@@ -839,7 +898,7 @@ class CoevolutionEngine:
             self._run_matches(gen)
 
             for trader in self.traders:
-                trader.finalize_fitness()
+                trader.finalize_fitness(cfg.trader_cvar)
 
             if self.env_pop is not None:
                 for ind in self.env_pop:

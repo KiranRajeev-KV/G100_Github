@@ -20,6 +20,37 @@ from segments import DESCRIPTOR_NAMES
 
 WEIGHT_BOUND = 3.0
 TEMP_BOUNDS = (0.2, 3.0)
+# KL(p || uniform) cap on every selection distribution, nats (0 = off). Set by the
+# engine from EngineConfig.adv_kl_budget.
+# ponytail: module global (one engine per process); move onto the individual if engines ever share a process with different budgets
+KL_BUDGET = 0.0
+
+
+def _softmax(logits):
+    logits = logits - logits.max()
+    p = np.exp(logits)
+    return p / p.sum()
+
+
+def _kl_uniform(p):
+    return float(np.log(len(p)) + np.sum(p * np.log(p + 1e-300)))
+
+
+def capped_probs(logits, budget):
+    """softmax(logits / m) with the smallest temperature multiplier m >= 1 that gives KL(p || uniform) <= budget."""
+    p = _softmax(logits)
+    if budget <= 0 or _kl_uniform(p) <= budget:
+        return p
+    lo, hi = 1.0, 2.0
+    while _kl_uniform(_softmax(logits / hi)) > budget:
+        lo, hi = hi, hi * 2
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if _kl_uniform(_softmax(logits / mid)) > budget else (lo, mid)
+    return _softmax(logits / hi)
+
+
+N_DESC = len(DESCRIPTOR_NAMES)   # genome length; the engine raises it when adv_gate_desc adds descriptors
 
 
 @dataclass
@@ -52,10 +83,7 @@ class EnvIndividual:
         return float(-np.sum(p * np.log(p + 1e-12)))
 
     def selection_probs(self, descriptor_matrix):
-        logits = descriptor_matrix @ self.weights / self.temperature
-        logits -= logits.max()
-        p = np.exp(logits)
-        return p / p.sum()
+        return capped_probs(descriptor_matrix @ self.weights / self.temperature, KL_BUDGET)
 
     def select_segments(self, pool, n, rng, regimes=None):
         probs = self.selection_probs(pool.descriptor_matrix)
@@ -86,7 +114,7 @@ class EnvIndividual:
 
 def random_individual(rng):
     return EnvIndividual(
-        weights=rng.uniform(-1.0, 1.0, size=len(DESCRIPTOR_NAMES)),
+        weights=rng.uniform(-1.0, 1.0, size=N_DESC),
         temperature=float(rng.uniform(0.5, 1.5)),
         shift=float(rng.uniform(-1.0, 1.0)),
         log_scale=float(rng.uniform(-0.5, 0.5)),
